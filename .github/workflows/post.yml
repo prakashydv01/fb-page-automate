@@ -1,0 +1,26 @@
+name: Post to Facebook
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"   # every 3 hours, UTC
+  workflow_dispatch:         # manual "Run workflow" button
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: node index.js
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
