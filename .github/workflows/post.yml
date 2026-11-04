@@ -2,7 +2,7 @@ name: Post to Facebook
 
 on:
   schedule:
-    - cron: "15 2,7,11,15 * * *"   # 8 AM, 1 PM, 5 PM, 9 PM Nepal time
+       - cron: "*/15 * * * *"   # 8 AM, 1 PM, 5 PM, 9 PM Nepal time
   workflow_dispatch:
 
 jobs:
