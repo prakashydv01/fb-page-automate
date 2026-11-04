@@ -1,12 +1,14 @@
 import "dotenv/config";
+import http from "http";
 import axios from "axios";
 import * as cheerio from "cheerio";
 import mongoose from "mongoose";
 import sharp from "sharp";
+import cron from "node-cron";
 
 const BASE = "https://www.collegenp.com";
 const SECTIONS = ["admission", "vacancy"];
-const GRAPH_VERSION = "v21.0"; // change if you want to match your Graph API Explorer version
+const GRAPH_VERSION = "v21.0";
 
 // ---------- MongoDB ----------
 const Post = mongoose.model(
@@ -46,19 +48,39 @@ function pickNoticeImage($) {
 }
 
 async function scrapeLatest(section) {
-  // 1) list page -> first post link
-  const list = await client.get(`${BASE}/${section}`);
+  // 1) list page -> candidate posts (only items that carry a date)
+  const list = await client.get(`${BASE}/${section}`, {
+    params: { _: Date.now() },
+    headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
+  });
   const $list = cheerio.load(list.data);
 
   const re = new RegExp(`^/${section}/[^/]+$`);
-  let postUrl = null;
-  $list("a[href]").each((_, el) => {
+  const found = [];
+  $list("a[href]").each((i, el) => {
     const u = new URL($list(el).attr("href"), BASE);
-    if (u.hostname.endsWith("collegenp.com") && re.test(u.pathname)) {
-      postUrl = u.origin + u.pathname;
-      return false; // first match only
-    }
+    if (!u.hostname.endsWith("collegenp.com") || !re.test(u.pathname)) return;
+
+    const text = $list(el).text().replace(/\s+/g, " ").trim();
+    const m = text.match(/(\d{4}-\d{2}-\d{2})/);
+    found.push({ url: u.origin + u.pathname, date: m ? m[1] : null, order: i });
   });
+
+  const seen = new Set();
+  const uniq = found.filter((f) => !seen.has(f.url) && seen.add(f.url));
+
+  const dated = uniq.filter((f) => f.date);
+  const pool = dated.length ? dated : uniq;
+  pool.sort(
+    (a, b) => (b.date || "").localeCompare(a.date || "") || a.order - b.order
+  );
+
+  console.log(
+    `[${section}] candidates:`,
+    pool.slice(0, 3).map((p) => `${p.date || "no-date"}  ${p.url}`)
+  );
+
+  const postUrl = pool[0]?.url;
   if (!postUrl) throw new Error(`No post link found in /${section}`);
 
   // 2) post page -> title + notice image
@@ -67,13 +89,11 @@ async function scrapeLatest(section) {
 
   const title =
     $('meta[property="og:title"]').attr("content") || $("h1").first().text().trim();
-
   const image = pickNoticeImage($);
 
   if (!title) throw new Error(`Missing title: ${postUrl}`);
   if (!image) throw new Error(`Notice image not found: ${postUrl}`);
 
-  console.log(`[${section}] image: ${image}`);
   return { section, url: postUrl, title: title.trim(), image };
 }
 
@@ -81,7 +101,6 @@ async function scrapeLatest(section) {
 const FB_URL = () =>
   `https://graph.facebook.com/${GRAPH_VERSION}/${process.env.FB_PAGE_ID}/photos`;
 
-// Download the image into memory, convert webp -> jpeg, upload the bytes
 async function uploadBytes({ title, image }) {
   const img = await client.get(image, { responseType: "arraybuffer" });
   let buf = Buffer.from(img.data);
@@ -102,11 +121,9 @@ async function uploadBytes({ title, image }) {
 }
 
 async function postToFacebook(item) {
-  // webp: always convert and upload bytes
   if (/\.webp(\?|$)/i.test(item.image)) return uploadBytes(item);
 
   try {
-    // png/jpg: let Facebook fetch the image from its URL
     const res = await axios.post(
       FB_URL(),
       new URLSearchParams({
@@ -117,43 +134,75 @@ async function postToFacebook(item) {
     );
     return res.data.post_id || res.data.id;
   } catch (err) {
-    console.warn(
-      "URL upload failed, uploading bytes:",
-      err.response?.data || err.message
-    );
+    console.warn("URL upload failed, uploading bytes:", err.response?.data || err.message);
     return uploadBytes(item);
   }
 }
 
 // ---------- Job ----------
+let running = false;
+
 async function run() {
-  let failed = false;
+  if (running) return; // never run two jobs at once
+  running = true;
+  console.log(`--- run started ${new Date().toISOString()} ---`);
 
-  for (const section of SECTIONS) {
-    try {
-      const item = await scrapeLatest(section);
+  try {
+    for (const section of SECTIONS) {
+      try {
+        const item = await scrapeLatest(section);
 
-      if (await Post.exists({ url: item.url })) {
-        console.log(`[${section}] already posted: ${item.title}`);
-        continue;
+        if (await Post.exists({ url: item.url })) {
+          console.log(`[${section}] already posted: ${item.title}`);
+          continue;
+        }
+
+        const fbPostId = await postToFacebook(item);
+        await Post.create({ ...item, fbPostId });
+        console.log(`[${section}] posted: ${item.title}`);
+      } catch (err) {
+        console.error(`[${section}] failed:`, err.response?.data || err.message);
       }
-
-      const fbPostId = await postToFacebook(item);
-      await Post.create({ ...item, fbPostId });
-      console.log(`[${section}] posted: ${item.title}`);
-    } catch (err) {
-      failed = true;
-      console.error(`[${section}] failed:`, err.response?.data || err.message);
     }
+  } finally {
+    running = false;
+    console.log("--- run finished ---");
   }
-  return failed;
 }
 
 // ---------- Start ----------
 await mongoose.connect(process.env.MONGO_URI);
 console.log("Mongo connected");
 
-const failed = await run();
+// 8 AM, 1 PM, 5 PM, 9 PM Nepal time
+cron.schedule("0 8,13,17,21 * * *", run, { timezone: "Asia/Kathmandu" });
 
-await mongoose.disconnect();
-process.exit(failed ? 1 : 0); // red X in GitHub Actions if something failed
+// Web server: keep-alive target + manual trigger
+http
+  .createServer((req, res) => {
+    const url = new URL(req.url, "http://localhost");
+
+    if (url.pathname === "/") {
+      res.end("ok");
+    } else if (
+      url.pathname === "/run" &&
+      process.env.RUN_KEY &&
+      url.searchParams.get("key") === process.env.RUN_KEY
+    ) {
+      run();
+      res.end("started");
+    } else {
+      res.statusCode = 404;
+      res.end("not found");
+    }
+  })
+  .listen(process.env.PORT || 3000, () => console.log("Server up"));
+
+// Self keep-alive (Render sets RENDER_EXTERNAL_URL automatically)
+if (process.env.RENDER_EXTERNAL_URL) {
+  setInterval(() => {
+    axios.get(process.env.RENDER_EXTERNAL_URL).catch(() => {});
+  }, 10 * 60 * 1000); // every 10 minutes
+}
+
+run(); // also check once on startup (duplicates are skipped)
