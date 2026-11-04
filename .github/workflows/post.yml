@@ -2,8 +2,8 @@ name: Post to Facebook
 
 on:
   schedule:
-    - cron: "0 */3 * * *"   # every 3 hours, UTC
-  workflow_dispatch:         # manual "Run workflow" button
+    - cron: "15 2,6,10,14 * * *"   # ~8 AM, 12 PM, 4 PM, 8 PM Nepal time
+  workflow_dispatch:                # manual "Run workflow" button
 
 jobs:
   post:
